@@ -38,42 +38,74 @@ def _get_product_by_any_id(col, pid: str):
 
 def _get_user_interacted_products(user_id: str, event_types: list = None, limit: int = 50):
     """Lấy danh sách product_id user đã tương tác, với trọng số theo loại event."""
-    event_service = _event()
-    events = event_service.get_user_events(user_id, event_types, limit=limit)
-    
     from datetime import datetime
+    
+    mongo = _mongo()
+    events_col = mongo.db["events"]  # Collection name từ screenshot
+    
+    # Build query - FIX: Dùng userId thay vì user_id
+    query = {"userId": user_id}
+    if event_types:
+        query["type"] = {"$in": event_types}
+    
+    # Sort theo ts (timestamp field trong MongoDB)
+    events = list(events_col.find(query).sort("ts", -1).limit(limit))
+    
+    logger.info(f"[DEBUG] User {user_id} has {len(events)} events from MongoDB")
+    
+    if not events:
+        logger.warning(f"[DEBUG] No events found for userId={user_id}")
+        return {}
+    
     interacted = defaultdict(lambda: {"weight": 0.0, "latest_time": None})
     weights = {"purchase": 3.0, "wishlist": 2.0, "cart": 1.5, "view": 1.0}
     
     for event in events:
-        pid = event.get("product_id")
+        # FIX: Dùng productId thay vì product_id
+        pid = event.get("productId")
         if not pid:
+            logger.warning(f"[DEBUG] Event missing productId: {event.get('_id')}")
             continue
+        
         etype = event.get("type")
-        timestamp = event.get("timestamp") or event.get("created_at")
+        # FIX: Dùng ts thay vì timestamp
+        timestamp = event.get("ts") or event.get("timestamp") or event.get("created_at")
         
         weight = weights.get(etype, 1.0)
         
-        # Time decay: events gần đây quan trọng hơn
+        # Time decay
         if timestamp:
             try:
                 if isinstance(timestamp, str):
                     event_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
                 else:
+                    # ts có thể là datetime object từ MongoDB
                     event_time = timestamp
-                days_old = (datetime.now(event_time.tzinfo) - event_time).days
-                decay = max(0.5, 1.0 - (days_old / 365))  # Giảm tối đa 50% sau 1 năm
+                
+                # Ensure timezone aware
+                if event_time.tzinfo is None:
+                    from datetime import timezone
+                    event_time = event_time.replace(tzinfo=timezone.utc)
+                
+                now = datetime.now(event_time.tzinfo)
+                days_old = (now - event_time).days
+                decay = max(0.5, 1.0 - (days_old / 365))
                 weight *= decay
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"[DEBUG] Failed to parse timestamp {timestamp}: {e}")
         
         interacted[pid]["weight"] += weight
         if not interacted[pid]["latest_time"] or (timestamp and timestamp > interacted[pid]["latest_time"]):
             interacted[pid]["latest_time"] = timestamp
     
-    # Chuyển về dict weight, sort theo weight giảm dần
+    logger.info(f"[DEBUG] Found {len(interacted)} unique products for user {user_id}")
+    if interacted:
+        top_3 = list(interacted.items())[:3]
+        logger.info(f"[DEBUG] Top 3 products: {top_3}")
+    
     result = {k: v["weight"] for k, v in interacted.items()}
     return dict(sorted(result.items(), key=lambda x: x[1], reverse=True))
+
 
 
 def _get_product(col, pid: str):
@@ -101,9 +133,11 @@ def recommend_for_user(user_id):
         event_types_str = request.args.get("event_types", "")
         event_types = [t.strip() for t in event_types_str.split(",") if t.strip()] if event_types_str else None
         
-        # 1. Lấy sản phẩm đã tương tác của user (đã sort theo weight)
+        # 1. Lấy sản phẩm đã tương tác của user
         interacted = _get_user_interacted_products(user_id, event_types, limit=100)
+        
         if not interacted:
+            logger.info(f"User {user_id} has no interaction history, returning popular products")
             return _get_popular_products(top_k)
         
         logger.info(f"User {user_id} has {len(interacted)} interacted products")
@@ -119,12 +153,16 @@ def recommend_for_user(user_id):
         for pid, weight in top_interacted:
             product = _get_product_by_any_id(col, pid)
             if not product:
+                logger.warning(f"[DEBUG] Product {pid} not found in products collection")
                 continue
             text = product.get("text_indexed") or f"{product.get('name', '')}. {product.get('description', '')}"
             user_texts.append(text)
         
         if not user_texts:
+            logger.warning("No valid products found from user history")
             return _get_popular_products(top_k)
+        
+        logger.info(f"Creating user profile from {len(user_texts)} products")
         
         # Tạo user profile embedding (trung bình có trọng số)
         user_profile_text = " | ".join(user_texts[:5])  # Ghép top 5 products
@@ -132,7 +170,6 @@ def recommend_for_user(user_id):
         
         if not user_emb:
             logger.warning("Failed to create user embedding, fallback to individual products")
-            # Fallback: Tìm similar từng product như cũ
             return _recommend_by_individual_products(user_id, interacted, col, top_k)
         
         # 3. Tìm candidates từ vector search
@@ -258,11 +295,11 @@ def _get_popular_products(top_k: int):
     """Fallback: Top products phổ biến dựa trên số events."""
     try:
         mongo = _mongo()
-        events_col = mongo.db["user_events"]  # Giả sử collection events là "user_events"
+        events_col = mongo.db["events"]  # FIX: Collection name
         
-        # Group by product_id và count
+        # Group by productId (not product_id)
         pipeline = [
-            {"$group": {"_id": "$product_id", "count": {"$sum": 1}}},
+            {"$group": {"_id": "$productId", "count": {"$sum": 1}}},
             {"$sort": {"count": -1}},
             {"$limit": top_k}
         ]
@@ -272,6 +309,8 @@ def _get_popular_products(top_k: int):
         results = []
         for doc in popular:
             pid = doc["_id"]
+            if not pid:
+                continue
             product = _get_product_by_any_id(col, pid)
             if product:
                 product["_id"] = str(product.get("_id", pid))
@@ -291,7 +330,6 @@ def _get_popular_products(top_k: int):
     except Exception as e:
         logger.exception("_get_popular_products failed")
         return jsonify({"error": "Failed to get popular products"}), 500
-
 # =======================
 # 2) Recommend theo PRODUCT (content-based)
 # =======================
