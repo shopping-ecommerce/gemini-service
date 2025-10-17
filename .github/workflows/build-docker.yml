@@ -1,0 +1,45 @@
+name: Docker Publish (gemini-service)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"] # để sinh tag semver nếu bạn push tag vX.Y.Z
+
+env:
+  IMAGE_NAME: gemini-service # tên image sau username (vd 0336784220/gemini-service)
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker meta (tags & labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch        # ví dụ: main
+            type=sha                     # sha rút gọn
+            type=raw,value=latest        # latest
+            type=semver,pattern={{version}}  # khi push tag v1.2.3
+          labels: |
+            org.opencontainers.image.source=${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build & Push
+        uses: docker/build-push-action@v6
+        with:
+          context: . # Dockerfile đang ở root repo của bạn
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # platforms: linux/amd64,linux/arm64  # (tùy chọn) multi-arch
+          # file: ./Dockerfile                  # (không cần vì tên mặc định là Dockerfile)
