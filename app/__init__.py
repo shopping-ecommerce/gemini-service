@@ -3,7 +3,7 @@ import logging
 from flask import Flask
 from .services.vertex_ai_service import VertexAIService
 from .services.mongodb_service import MongoDBService
-from .services.event_service import EventService  # THÊM IMPORT
+from .services.event_service import EventService
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +43,8 @@ def create_app(config=None):
     except Exception as e:
         logger.error(f"Failed to initialize MongoDB: {e}")
         raise
+    
+    # 2. Khởi tạo Vertex AI Service
     try:
         vertex_ai_service = VertexAIService(
             project_id=PROJECT_ID,
@@ -57,32 +59,31 @@ def create_app(config=None):
         logger.error(f"Failed to initialize Vertex AI: {e}")
         raise
     
+    # 3. Khởi tạo Event Service
     event_service = EventService(mongodb_service=mongodb_service)
     app.config['EVENT_SERVICE'] = event_service
     logger.info("✓ Event Service initialized")
     
-    # 6. Register blueprints
+    # 4. Register blueprints với prefix /gemini
     try:
         from .routes.index_ops import index_bp
         from .routes.health import health_bp
         from .routes.products import products_bp
         from .routes.search import search_bp
         from .routes.events import events_bp
-        # Nếu bạn có similar_bp, import ở đây:
         from .routes.similar import similar_bp
         from .routes.recommend import recommend_bp
 
-        app.register_blueprint(index_bp,   url_prefix="/api/index")
-        app.register_blueprint(search_bp,  url_prefix="/api/search")
-        app.register_blueprint(products_bp, url_prefix="/api/products")
-        app.register_blueprint(events_bp,  url_prefix="/api/events")
-        app.register_blueprint(health_bp,  url_prefix="/api")   # /api/health
-        app.register_blueprint(similar_bp, url_prefix="/api/search")
-        app.register_blueprint(recommend_bp, url_prefix="/api/recommend")
-        # Nếu có similar:
-        # app.register_blueprint(similar_bp, url_prefix="/api/search")
+        # Tất cả routes đều dưới /gemini
+        app.register_blueprint(health_bp,     url_prefix="/gemini")
+        app.register_blueprint(index_bp,      url_prefix="/gemini/index")
+        app.register_blueprint(search_bp,     url_prefix="/gemini/search")
+        app.register_blueprint(products_bp,   url_prefix="/gemini/products")
+        app.register_blueprint(events_bp,     url_prefix="/gemini/events")
+        app.register_blueprint(similar_bp,    url_prefix="/gemini/similar")
+        app.register_blueprint(recommend_bp,  url_prefix="/gemini/recommend")
 
-        logger.info("✓ Blueprints registered")
+        logger.info("✓ Blueprints registered under /gemini")
     except ImportError as e:
         logger.warning("Could not import blueprints: %s", e)
     
@@ -96,24 +97,21 @@ def create_app(config=None):
         logger.error(f"Internal error: {error}")
         return {"error": "Internal server error"}, 500
     
-    # Health check
-    @app.route('/health')
-    def health():
-        return {"status": "healthy", "service": "product-search-api"}, 200
-    
-    # Root
+    # Root endpoint
     @app.route('/')
     def root():
         return {
-            "service": "Product Search & Recommendation API",
+            "service": "Gemini Product Search & Recommendation API",
             "version": "2.0",
+            "base_path": "/gemini",
             "endpoints": {
-                "health": "/health",
-                "search": "/api/search",
-                "events": "/api/events",
-                # "products": "/api/products",
-                "index": "/api/index",
-                "recommend": "/api/recommend",
+                "health": "/gemini/health",
+                "search": "/gemini/search",
+                "similar": "/gemini/similar",
+                "recommend": "/gemini/recommend",
+                "events": "/gemini/events",
+                "products": "/gemini/products",
+                "index": "/gemini/index",
             }
         }, 200
     
