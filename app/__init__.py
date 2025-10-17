@@ -70,6 +70,7 @@ def create_app(config=None):
         from .routes.events import events_bp
         # Nếu bạn có similar_bp, import ở đây:
         from .routes.similar import similar_bp
+        from .routes.recommend import recommend_bp
 
         app.register_blueprint(index_bp,   url_prefix="/api/index")
         app.register_blueprint(search_bp,  url_prefix="/api/search")
@@ -77,7 +78,7 @@ def create_app(config=None):
         app.register_blueprint(events_bp,  url_prefix="/api/events")
         app.register_blueprint(health_bp,  url_prefix="/api")   # /api/health
         app.register_blueprint(similar_bp, url_prefix="/api/search")
-
+        app.register_blueprint(recommend_bp, url_prefix="/api/recommend")
         # Nếu có similar:
         # app.register_blueprint(similar_bp, url_prefix="/api/search")
 
@@ -109,10 +110,10 @@ def create_app(config=None):
             "endpoints": {
                 "health": "/health",
                 "search": "/api/search",
-                # "recommend": "/api/recommend",
                 "events": "/api/events",
                 # "products": "/api/products",
-                "index": "/api/index"
+                "index": "/api/index",
+                "recommend": "/api/recommend",
             }
         }, 200
     

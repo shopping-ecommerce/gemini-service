@@ -3,6 +3,8 @@ from typing import Dict, List, Optional
 from datetime import datetime
 from bson import ObjectId
 
+# from app.routes.recommend import _weighted_mean
+
 logger = logging.getLogger(__name__)
 
 class EventService:
@@ -197,3 +199,24 @@ class EventService:
         except Exception as e:
             logger.error(f"Error batch tracking events: {e}")
             raise
+    # def build_user_profile_vector(self, user_id: str, lookback_days=90, weights=None):
+    #     from datetime import datetime, timedelta
+    #     weights = weights or {"purchase":3.0, "cart":2.0, "wishlist":1.5, "view":1.0}
+
+    #     events_col = self.mongodb_service.db["events"]
+    #     emb_col = self.mongodb_service.db["product_embeddings"]
+
+    #     since = datetime.utcnow() - timedelta(days=lookback_days)
+    #     user_events = list(events_col.find({"user_id": user_id, "timestamp": {"$gte": since}})
+    #                                   .sort("timestamp", -1).limit(500))
+    #     vecs, vws = [], []
+    #     for ev in user_events:
+    #         pid = str(ev.get("product_id") or "")
+    #         et = (ev.get("type") or "").lower()
+    #         w = float(weights.get(et, weights.get("view", 1.0)))
+    #         emb_doc = emb_col.find_one({"product_id": pid}, {"embedding": 1})
+    #         if emb_doc and emb_doc.get("embedding"):
+    #             vecs.append(emb_doc["embedding"])
+    #             vws.append(w)
+
+    #     return _weighted_mean(vecs, vws)  # bạn có thể copy _weighted_mean vào đây
