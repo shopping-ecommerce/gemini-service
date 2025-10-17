@@ -14,12 +14,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Create credentials file from GitHub secret
+      # Create credentials file from GitHub secret at repo root
       - name: Create credentials file
         run: |
-          mkdir -p ./gemini-service
-          echo "${{ secrets.GCP_CREDENTIALS_JSON }}" > ./gemini-service/credentials.json
-          ls -la ./gemini-service/credentials.json
+          echo "${{ secrets.GCP_CREDENTIALS_JSON }}" > ./credentials.json
+          chmod 600 ./credentials.json
+          ls -la ./credentials.json
 
       - name: Docker meta (tags & labels)
         id: meta
@@ -41,7 +41,8 @@ jobs:
       - name: Build & Push
         uses: docker/build-push-action@v6
         with:
-          context: ./gemini-service
+          context: .
+          file: ./Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -49,4 +50,4 @@ jobs:
       # Clean up credentials
       - name: Clean up
         if: always()
-        run: rm -f ./gemini-service/credentials.json
+        run: rm -f ./credentials.json
