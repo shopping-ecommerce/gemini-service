@@ -36,21 +36,45 @@ def _get_product_by_any_id(col, pid: str):
         return p
     return col.find_one({"id": pid})
 
-def _get_user_interacted_products(user_id: str, event_types: list = None):
+def _get_user_interacted_products(user_id: str, event_types: list = None, limit: int = 50):
     """Lấy danh sách product_id user đã tương tác, với trọng số theo loại event."""
     event_service = _event()
-    events = event_service.get_user_events(user_id, event_types, limit=50)  # Giới hạn để tránh quá nhiều
+    events = event_service.get_user_events(user_id, event_types, limit=limit)
     
-    interacted = defaultdict(float)  # product_id -> weight (cao hơn nếu purchase/wishlist)
+    from datetime import datetime
+    interacted = defaultdict(lambda: {"weight": 0.0, "latest_time": None})
     weights = {"purchase": 3.0, "wishlist": 2.0, "cart": 1.5, "view": 1.0}
     
     for event in events:
         pid = event.get("product_id")
+        if not pid:
+            continue
         etype = event.get("type")
+        timestamp = event.get("timestamp") or event.get("created_at")
+        
         weight = weights.get(etype, 1.0)
-        interacted[pid] += weight
+        
+        # Time decay: events gần đây quan trọng hơn
+        if timestamp:
+            try:
+                if isinstance(timestamp, str):
+                    event_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                else:
+                    event_time = timestamp
+                days_old = (datetime.now(event_time.tzinfo) - event_time).days
+                decay = max(0.5, 1.0 - (days_old / 365))  # Giảm tối đa 50% sau 1 năm
+                weight *= decay
+            except:
+                pass
+        
+        interacted[pid]["weight"] += weight
+        if not interacted[pid]["latest_time"] or (timestamp and timestamp > interacted[pid]["latest_time"]):
+            interacted[pid]["latest_time"] = timestamp
     
-    return dict(interacted)
+    # Chuyển về dict weight, sort theo weight giảm dần
+    result = {k: v["weight"] for k, v in interacted.items()}
+    return dict(sorted(result.items(), key=lambda x: x[1], reverse=True))
+
 
 def _get_product(col, pid: str):
     # Tìm theo nhiều kiểu id: ObjectId(_id) -> _id string -> field "id"
@@ -67,70 +91,105 @@ def recommend_for_user(user_id):
     Gợi ý sản phẩm dựa trên lịch sử user.
     
     Query params:
-    - top_k: Số lượng gợi ý (default: 5)
+    - top_k: Số lượng gợi ý (default: 20)
     - event_types: List loại event để filter (e.g., "purchase,wishlist", default: all)
+    - diversity: Mức độ đa dạng 0.0-1.0 (default: 0.3)
     """
     try:
         top_k = int(request.args.get("top_k", 20))
+        diversity = float(request.args.get("diversity", 0.3))
         event_types_str = request.args.get("event_types", "")
         event_types = [t.strip() for t in event_types_str.split(",") if t.strip()] if event_types_str else None
         
-        # 1. Lấy sản phẩm đã tương tác của user
-        interacted = _get_user_interacted_products(user_id, event_types)
+        # 1. Lấy sản phẩm đã tương tác của user (đã sort theo weight)
+        interacted = _get_user_interacted_products(user_id, event_types, limit=100)
         if not interacted:
-            # Fallback: Top popular products (dựa trên số events của product)
             return _get_popular_products(top_k)
         
-        # 2. Tìm similar cho từng interacted product
+        logger.info(f"User {user_id} has {len(interacted)} interacted products")
+        
+        # 2. Tạo user preference embedding từ top interacted products
         mongo = _mongo()
         col = mongo.db[current_app.config.get("COLLECTION_NAME", "products")]
         
-        candidates = defaultdict(float)  # product_id -> aggregated_score
-        exclude_ids = set(interacted.keys())  # Loại trừ đã tương tác
+        # Lấy top 10 products quan trọng nhất để tạo profile
+        top_interacted = list(interacted.items())[:10]
+        user_texts = []
         
-        for pid, weight in interacted.items():
+        for pid, weight in top_interacted:
             product = _get_product_by_any_id(col, pid)
             if not product:
                 continue
-            
-            # Text để embedding (tương tự similar.py)
-            name = product.get("name", "")
-            desc = product.get("description", "")
-            text = product.get("text_indexed", f"{name}. {desc}")
-            
-            # Tạo embedding và tìm neighbors
-            emb = _vs().create_embedding(text, task_type="RETRIEVAL_DOCUMENT")
-            if not emb:
+            text = product.get("text_indexed") or f"{product.get('name', '')}. {product.get('description', '')}"
+            user_texts.append(text)
+        
+        if not user_texts:
+            return _get_popular_products(top_k)
+        
+        # Tạo user profile embedding (trung bình có trọng số)
+        user_profile_text = " | ".join(user_texts[:5])  # Ghép top 5 products
+        user_emb = _vs().create_embedding(user_profile_text, task_type="RETRIEVAL_QUERY")
+        
+        if not user_emb:
+            logger.warning("Failed to create user embedding, fallback to individual products")
+            # Fallback: Tìm similar từng product như cũ
+            return _recommend_by_individual_products(user_id, interacted, col, top_k)
+        
+        # 3. Tìm candidates từ vector search
+        exclude_ids = set(interacted.keys())
+        neighbors = _vs().find_neighbors(user_emb, k=top_k * 3)  # Lấy nhiều để filter
+        
+        candidates = {}
+        seen_categories = defaultdict(int)  # Track category diversity
+        
+        for nid, dist in neighbors:
+            nid_str = str(nid)
+            if nid_str in exclude_ids:
                 continue
             
-            neighbors = _vs().find_neighbors(emb, k=top_k * 2)  # Lấy nhiều hơn để filter
+            product = _get_product_by_any_id(col, nid_str)
+            if not product:
+                continue
             
-            for nid, dist in neighbors:
-                nid_str = str(nid)
-                if nid_str in exclude_ids:
-                    continue
-                # Score: similarity (1 - dist, giả sử dist 0-1) * weight từ interacted
-                sim_score = 1.0 - float(dist)  # Chuyển dist thành sim (càng giống càng cao)
-                candidates[nid_str] += sim_score * weight
+            # Tính similarity score (1 - distance)
+            sim_score = max(0, 1.0 - float(dist))
+            
+            # Diversity penalty: giảm score nếu category đã có nhiều
+            category = product.get("category") or product.get("categoryId")
+            if category and diversity > 0:
+                category_count = seen_categories.get(category, 0)
+                diversity_penalty = diversity * (category_count * 0.1)  # Mỗi item cùng category giảm 10%
+                sim_score *= (1.0 - min(0.5, diversity_penalty))
+            
+            candidates[nid_str] = {
+                "score": sim_score,
+                "product": product,
+                "category": category
+            }
+            
+            if category:
+                seen_categories[category] += 1
+            
+            if len(candidates) >= top_k * 2:
+                break
         
-        # 3. Sort và lấy top
-        sorted_candidates = sorted(candidates.items(), key=lambda x: x[1], reverse=True)
-        top_ids = [pid for pid, _ in sorted_candidates[:top_k]]
+        # 4. Sort và lấy top
+        sorted_candidates = sorted(candidates.items(), key=lambda x: x[1]["score"], reverse=True)[:top_k]
         
-        # 4. Lấy chi tiết products
         results = []
-        for pid in top_ids:
-            product = _get_product_by_any_id(col, pid)
-            if product:
-                product["_id"] = str(product.get("_id", pid))
-                results.append({
-                    "product": product,
-                    "recommend_score": candidates[pid]  # Score tổng
-                })
+        for pid, data in sorted_candidates:
+            product = data["product"]
+            product["_id"] = str(product.get("_id", pid))
+            results.append({
+                "product": product,
+                "recommend_score": round(data["score"], 4)
+            })
         
         return jsonify({
             "success": True,
             "user_id": user_id,
+            "strategy": "personalized_content_based",
+            "total_interactions": len(interacted),
             "total_recommendations": len(results),
             "recommendations": results
         }), 200
@@ -138,6 +197,62 @@ def recommend_for_user(user_id):
     except Exception as e:
         logger.exception("recommend_for_user failed")
         return jsonify({"error": str(e)}), 500
+
+def _recommend_by_individual_products(user_id, interacted, col, top_k):
+    """Fallback: Tìm similar từng product rồi aggregate (logic cũ nhưng cải thiện)"""
+    candidates = defaultdict(lambda: {"score": 0.0, "count": 0})
+    exclude_ids = set(interacted.keys())
+    
+    # Chỉ lấy top 5 interacted products quan trọng nhất
+    top_interacted = list(interacted.items())[:5]
+    
+    for pid, weight in top_interacted:
+        product = _get_product_by_any_id(col, pid)
+        if not product:
+            continue
+        
+        text = product.get("text_indexed") or f"{product.get('name', '')}. {product.get('description', '')}"
+        emb = _vs().create_embedding(text, task_type="RETRIEVAL_DOCUMENT")
+        if not emb:
+            continue
+        
+        neighbors = _vs().find_neighbors(emb, k=top_k * 2)
+        
+        for nid, dist in neighbors:
+            nid_str = str(nid)
+            if nid_str in exclude_ids:
+                continue
+            
+            sim_score = max(0, 1.0 - float(dist))
+            # Normalize by count để tránh bias
+            candidates[nid_str]["score"] += sim_score * weight
+            candidates[nid_str]["count"] += 1
+    
+    # Normalize scores
+    for pid in candidates:
+        if candidates[pid]["count"] > 0:
+            candidates[pid]["score"] /= candidates[pid]["count"]
+    
+    sorted_candidates = sorted(candidates.items(), key=lambda x: x[1]["score"], reverse=True)[:top_k]
+    
+    results = []
+    for pid, data in sorted_candidates:
+        product = _get_product_by_any_id(col, pid)
+        if product:
+            product["_id"] = str(product.get("_id", pid))
+            results.append({
+                "product": product,
+                "recommend_score": round(data["score"], 4)
+            })
+    
+    return jsonify({
+        "success": True,
+        "user_id": user_id,
+        "strategy": "aggregated_content_based",
+        "total_recommendations": len(results),
+        "recommendations": results
+    }), 200
+
 
 def _get_popular_products(top_k: int):
     """Fallback: Top products phổ biến dựa trên số events."""
