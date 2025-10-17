@@ -4,4 +4,5 @@ __pycache__/
 .venv/
 *.pyc
 .env
-credentials.json
+# Nếu trước đó có *.json thì bật lại file credentials:
+!credentials.json

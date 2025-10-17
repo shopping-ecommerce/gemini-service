@@ -1,5 +1,8 @@
 FROM python:3.12-slim AS base
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+# Thêm dòng này để SDK biết đường dẫn:
+ENV GOOGLE_APPLICATION_CREDENTIALS=/app/credentials.json
+
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY requirements.txt .
