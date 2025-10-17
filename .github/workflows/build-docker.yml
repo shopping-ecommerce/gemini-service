@@ -17,7 +17,8 @@ jobs:
       # Create credentials file from GitHub secret
       - name: Create credentials file
         run: |
-          echo '${{ secrets.GCP_CREDENTIALS_JSON }}' > ./gemini-service/credentials.json
+          mkdir -p ./gemini-service
+          echo "${{ secrets.GCP_CREDENTIALS_JSON }}" > ./gemini-service/credentials.json
           ls -la ./gemini-service/credentials.json
 
       - name: Docker meta (tags & labels)
