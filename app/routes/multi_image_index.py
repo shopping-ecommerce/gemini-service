@@ -93,7 +93,8 @@ def rebuild_image_index_multi():
         if to_embed:
             logger.info(f"Sample images: {to_embed[:3]}")
 
-        batch_size = 10
+        # Giảm batch_size để tránh quota
+        batch_size = 3  # Giảm từ 10 xuống 3
         total_upsert = 0
         failed_count = 0
 
@@ -122,7 +123,7 @@ def rebuild_image_index_multi():
                         failed_count += 1
                         continue
                     
-                    # Tạo embedding
+                    # Tạo embedding với delay để tránh quota
                     emb = _vs().create_image_embedding_from_bytes(image_bytes)
                     if emb:
                         batch_embeddings.append({
@@ -135,6 +136,9 @@ def rebuild_image_index_multi():
                         })
                     else:
                         failed_count += 1
+                    
+                    # Delay giữa các request để tránh quota
+                    time.sleep(0.5)
                     
                 except Exception as e:
                     logger.warning(f"Failed to embed {datapoint_id}: {e}")
@@ -174,7 +178,8 @@ def rebuild_image_index_multi():
                     except Exception as ve:
                         logger.error(f"Failed to upsert image vectors: {ve}")
 
-            time.sleep(1.0)
+            # Tăng delay giữa các batch
+            time.sleep(2.0)  # Tăng từ 1.0 lên 2.0
 
         return jsonify({
             "success": True,
