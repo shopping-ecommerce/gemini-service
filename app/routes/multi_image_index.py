@@ -209,40 +209,54 @@ def search_by_image_multi():
     Tìm kiếm với multi-image support
     
     Kết quả sẽ group theo product_id và lấy match tốt nhất
+    
+    Distance nhỏ = Similarity cao = Giống nhau
     """
     try:
         from flask import request
         import base64
         from bson import ObjectId
+        import math
         
         image_bytes = None
         query_emb = None
+        final_top_k = 5  # Số products cần trả về
+        data = {}
+        
+        content_type = request.content_type or ""
+        is_multipart = "multipart/form-data" in content_type
         
         # Parse request
-        if request.content_type and 'multipart/form-data' in request.content_type:
-            if 'image' not in request.files:
+        if is_multipart:
+            if "image" not in request.files:
                 return jsonify({"error": "No image file provided"}), 400
-            file = request.files['image']
-            if file.filename == '':
+            file = request.files["image"]
+            if file.filename == "":
                 return jsonify({"error": "Empty filename"}), 400
             image_bytes = file.read()
-            final_top_k = int(request.form.get('top_k', 5))
+            final_top_k = int(request.form.get("top_k", 5))
         else:
             data = request.get_json(silent=True) or {}
-            final_top_k = int(data.get('top_k', 5))
+            final_top_k = int(data.get("top_k", 5))
             
-            if 'image_base64' in data:
+            if "image_base64" in data:
                 image_bytes = base64.b64decode(
-                    data['image_base64'].split(',')[1] 
-                    if ',' in data['image_base64'] 
-                    else data['image_base64']
+                    data["image_base64"].split(",")[1]
+                    if "," in data["image_base64"]
+                    else data["image_base64"]
                 )
-            elif 'gcs_uri' in data:
-                query_emb = _vs().create_image_embedding_from_url(data['gcs_uri'])
+            elif "gcs_uri" in data:
+                query_emb = _vs().create_image_embedding_from_url(data["gcs_uri"])
             else:
-                return jsonify({"error": "No image provided (need image_base64 or gcs_uri)"}), 400
+                return jsonify({"error": "No image provided"}), 400
 
-        # Tạo embedding nếu chưa có
+        # Optional: ngưỡng lọc similarity
+        try:
+            min_similarity = float(request.form.get("min_similarity", 0.0)) if is_multipart else float(data.get("min_similarity", 0.0))
+        except Exception:
+            min_similarity = 0.0
+
+        # Tạo embedding từ ảnh
         if image_bytes and not query_emb:
             query_emb = _vs().create_image_embedding_from_bytes(image_bytes)
         
@@ -250,11 +264,8 @@ def search_by_image_multi():
             return jsonify({"error": "Failed to create image embedding"}), 500
 
         # Tìm kiếm trong image index
-        # Tăng multiplier để đảm bảo có đủ unique products sau khi group
-        search_multiplier = 10  # Tăng từ 4 lên 10
-        top_k = min(final_top_k * search_multiplier, 100)  # Max 100 để tránh quá tải
-        
-        neighbors = _vs().find_image_neighbors(query_emb, k=top_k)
+        search_k = final_top_k * 10  # Lấy dư để đủ sản phẩm sau khi group
+        neighbors = _vs().find_image_neighbors(query_emb, k=search_k)
         
         if not neighbors:
             return jsonify({
@@ -265,35 +276,37 @@ def search_by_image_multi():
                 "message": "No similar images found"
             }), 200
 
-        # Group theo product_id và lấy best match
+        # Group theo product_id và lấy best match (distance nhỏ nhất)
         mongo = current_app.config["MONGODB_SERVICE"]
         products_col = mongo.db["products"]
         image_embeddings_col = mongo.db["product_image_embeddings"]
         
-        product_scores = {}  # {product_id: (best_score, matched_image_url, position)}
+        # {product_id: {"distance": float, "matched_image_url": str, "position": int, "datapoint_id": str, "embedding": list}}
+        product_scores = {}
         
-        for datapoint_id, dist in neighbors:
+        for datapoint_id, distance in neighbors:
             # Parse datapoint_id: "product_id_position"
-            parts = datapoint_id.rsplit('_', 1)
+            parts = datapoint_id.rsplit("_", 1)
             if len(parts) != 2:
                 logger.warning(f"Invalid datapoint_id format: {datapoint_id}")
                 continue
             
             product_id = parts[0]
             
-            # Lưu best match (distance nhỏ nhất = similarity cao nhất)
-            if product_id not in product_scores or dist < product_scores[product_id][0]:
-                # Lấy image info từ MongoDB
+            # Lưu best match (distance nhỏ nhất)
+            if product_id not in product_scores or distance < product_scores[product_id]["distance"]:
                 img_doc = image_embeddings_col.find_one(
                     {"datapoint_id": datapoint_id},
-                    {"image_url": 1, "position": 1}
+                    {"image_url": 1, "position": 1, "embedding": 1}
                 )
                 if img_doc:
-                    product_scores[product_id] = (
-                        dist,
-                        img_doc.get("image_url"),
-                        img_doc.get("position", 0)
-                    )
+                    product_scores[product_id] = {
+                        "distance": float(distance),
+                        "matched_image_url": img_doc.get("image_url"),
+                        "position": img_doc.get("position", 0),
+                        "datapoint_id": datapoint_id,
+                        "embedding": img_doc.get("embedding"),
+                    }
 
         if not product_scores:
             return jsonify({
@@ -301,44 +314,82 @@ def search_by_image_multi():
                 "search_type": "multi_image",
                 "total_results": 0,
                 "results": [],
-                "message": "No products found matching the image"
+                "message": "No products found"
             }), 200
 
-        # Sắp xếp theo score (distance nhỏ nhất = tốt nhất) và lấy top N
-        sorted_products = sorted(product_scores.items(), key=lambda x: x[1][0])[:final_top_k]
-
-        # Log để debug
-        logger.info(f"Search stats: requested={final_top_k}, searched={top_k} images, found={len(product_scores)} unique products, returning={len(sorted_products)}")
-
-        # Lấy thông tin product từ MongoDB
-        product_ids = [product_id for product_id, _ in sorted_products]
+        # Sắp xếp theo distance (nhỏ nhất = tốt nhất) và lấy top N
+        sorted_products = sorted(product_scores.items(), key=lambda x: x[1]["distance"])[:final_top_k]
         
-        # Convert to ObjectId nếu cần
+        logger.info(f"Search: found {len(product_scores)} unique products, returning top {len(sorted_products)}")
+
+        # Batch query products từ MongoDB
+        product_ids = [pid for pid, _ in sorted_products]
         oids = []
         for pid in product_ids:
             try:
                 oids.append(ObjectId(pid) if ObjectId.is_valid(pid) else pid)
-            except:
+            except Exception:
                 oids.append(pid)
         
-        # Batch query tất cả products cùng lúc
-        products = {str(p["_id"]): p for p in products_col.find({"_id": {"$in": oids}})}
+        products_dict = {str(p["_id"]): p for p in products_col.find({"_id": {"$in": oids}})}
+
+        # Helper tính cosine
+        def _cosine(a, b):
+            try:
+                n = min(len(a), len(b))
+                if n == 0:
+                    return 0.0
+                dot = 0.0
+                sa = 0.0
+                sb = 0.0
+                for i in range(n):
+                    ai = float(a[i])
+                    bi = float(b[i])
+                    dot += ai * bi
+                    sa += ai * ai
+                    sb += bi * bi
+                if sa == 0.0 or sb == 0.0:
+                    return 0.0
+                return dot / (math.sqrt(sa) * math.sqrt(sb))
+            except Exception:
+                return 0.0
 
         # Build results
         results = []
-        for product_id, (score, matched_url, position) in sorted_products:
-            product = products.get(product_id)
-            
+        for product_id, info in sorted_products:
+            product = products_dict.get(product_id)
             if not product:
                 logger.warning(f"Product not found: {product_id}")
                 continue
 
-            # Convert ObjectId to string
             product["_id"] = str(product["_id"])
+            distance = float(info["distance"])
+            matched_url = info["matched_image_url"]
+            position = info["position"]
+            emb = info.get("embedding")
+
+            # Ưu tiên tính cosine similarity trực tiếp từ embedding
+            if emb:
+                cos = _cosine(query_emb, emb)
+                similarity = (cos + 1.0) / 2.0  # map [-1,1] -> [0,1]
+            else:
+                # Fallback nếu không có embedding: giả định distance là cosine distance trong [0,2]
+                similarity = 1.0 - (distance / 2.0)
+
+            # Clamp [0,1]
+            if similarity < 0.0:
+                similarity = 0.0
+            elif similarity > 1.0:
+                similarity = 1.0
+
+            # Lọc theo ngưỡng
+            if similarity < min_similarity:
+                continue
 
             results.append({
                 "product": product,
-                "similarity_score": float(score),
+                "similarity_score": round(similarity, 4),
+                "distance": round(distance, 4),
                 "matched_image": {
                     "url": matched_url,
                     "position": position
