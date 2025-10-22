@@ -85,7 +85,6 @@ def create_app(config=None):
         from .routes.events import events_bp
         from .routes.similar import similar_bp
         from .routes.recommend import recommend_bp
-        from .routes.image_search import image_search_bp
         from .routes.multi_image_index import multi_image_index_bp
 
         # Tất cả routes đều dưới /gemini
@@ -96,7 +95,6 @@ def create_app(config=None):
         app.register_blueprint(events_bp,             url_prefix="/gemini/events")
         app.register_blueprint(similar_bp,            url_prefix="/gemini/similar")
         app.register_blueprint(recommend_bp,          url_prefix="/gemini/recommend")
-        app.register_blueprint(image_search_bp,       url_prefix="/gemini/search")
         app.register_blueprint(multi_image_index_bp,  url_prefix="/gemini/index")
 
         logger.info("✓ Blueprints registered under /gemini (including multi-image search)")
