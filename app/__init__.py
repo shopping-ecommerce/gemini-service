@@ -20,14 +20,21 @@ def create_app(config=None):
     # GCP configs
     PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
     LOCATION = os.environ.get("GCP_LOCATION", "asia-southeast1")
+    
+    # Text index configs
     INDEX_ENDPOINT_ID = os.environ.get("INDEX_ENDPOINT_ID")
     DEPLOYED_INDEX_ID = os.environ.get("DEPLOYED_INDEX_ID")
     INDEX_ID = os.environ.get("INDEX_ID")
+
+    # Image index configs
+    IMAGE_INDEX_ENDPOINT_ID = os.environ.get("IMAGE_INDEX_ENDPOINT_ID")
+    IMAGE_DEPLOYED_INDEX_ID = os.environ.get("IMAGE_DEPLOYED_INDEX_ID")
+    IMAGE_INDEX_ID = os.environ.get("IMAGE_INDEX_ID")
     
     # MongoDB config
     MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://root:root@localhost:27017/product_db?authSource=admin")
     
-    # Validate
+    # Validate required configs
     if not PROJECT_ID:
         raise ValueError("GCP_PROJECT_ID is required")
     if not INDEX_ENDPOINT_ID:
@@ -44,17 +51,22 @@ def create_app(config=None):
         logger.error(f"Failed to initialize MongoDB: {e}")
         raise
     
-    # 2. Khởi tạo Vertex AI Service
+    # 2. Khởi tạo Vertex AI Service (với cả text và image)
     try:
         vertex_ai_service = VertexAIService(
             project_id=PROJECT_ID,
             location=LOCATION,
+            # Text index
             index_endpoint_id=INDEX_ENDPOINT_ID,
             deployed_index_id=DEPLOYED_INDEX_ID,
-            index_id=INDEX_ID
+            index_id=INDEX_ID,
+            # Image index
+            image_index_endpoint_id=IMAGE_INDEX_ENDPOINT_ID,
+            image_deployed_index_id=IMAGE_DEPLOYED_INDEX_ID,
+            image_index_id=IMAGE_INDEX_ID
         )
         app.config['VERTEX_AI_SERVICE'] = vertex_ai_service
-        logger.info("✓ Vertex AI Service initialized")
+        logger.info("✓ Vertex AI Service initialized (text + image)")
     except Exception as e:
         logger.error(f"Failed to initialize Vertex AI: {e}")
         raise
@@ -73,17 +85,21 @@ def create_app(config=None):
         from .routes.events import events_bp
         from .routes.similar import similar_bp
         from .routes.recommend import recommend_bp
+        from .routes.image_search import image_search_bp
+        from .routes.multi_image_index import multi_image_index_bp
 
         # Tất cả routes đều dưới /gemini
-        app.register_blueprint(health_bp,     url_prefix="/gemini")
-        app.register_blueprint(index_bp,      url_prefix="/gemini/index")
-        app.register_blueprint(search_bp,     url_prefix="/gemini/search")
-        app.register_blueprint(products_bp,   url_prefix="/gemini/products")
-        app.register_blueprint(events_bp,     url_prefix="/gemini/events")
-        app.register_blueprint(similar_bp,    url_prefix="/gemini/similar")
-        app.register_blueprint(recommend_bp,  url_prefix="/gemini/recommend")
+        app.register_blueprint(health_bp,             url_prefix="/gemini")
+        app.register_blueprint(index_bp,              url_prefix="/gemini/index")
+        app.register_blueprint(search_bp,             url_prefix="/gemini/search")
+        app.register_blueprint(products_bp,           url_prefix="/gemini/products")
+        app.register_blueprint(events_bp,             url_prefix="/gemini/events")
+        app.register_blueprint(similar_bp,            url_prefix="/gemini/similar")
+        app.register_blueprint(recommend_bp,          url_prefix="/gemini/recommend")
+        app.register_blueprint(image_search_bp,       url_prefix="/gemini/search")
+        app.register_blueprint(multi_image_index_bp,  url_prefix="/gemini/index")
 
-        logger.info("✓ Blueprints registered under /gemini")
+        logger.info("✓ Blueprints registered under /gemini (including multi-image search)")
     except ImportError as e:
         logger.warning("Could not import blueprints: %s", e)
     
@@ -102,16 +118,26 @@ def create_app(config=None):
     def root():
         return {
             "service": "Gemini Product Search & Recommendation API",
-            "version": "2.0",
+            "version": "2.1",
             "base_path": "/gemini",
             "endpoints": {
                 "health": "/gemini/health",
-                "search": "/gemini/search",
+                "search": {
+                    "text": "/gemini/search/search",
+                    "image": "/gemini/search/search-by-image",
+                    "image_multi": "/gemini/index/search-by-image-multi",
+                    "text_and_image": "/gemini/search/search-by-text-and-image"
+                },
                 "similar": "/gemini/similar",
                 "recommend": "/gemini/recommend",
                 "events": "/gemini/events",
                 "products": "/gemini/products",
-                "index": "/gemini/index",
+                "index": {
+                    "rebuild_text": "/gemini/index/rebuild-index",
+                    "rebuild_image_multi": "/gemini/index/rebuild-image-index-multi",
+                    "index_single_image": "/gemini/index/index-product-image",
+                    "delete_image": "/gemini/index/delete-product-image"
+                }
             }
         }, 200
     
