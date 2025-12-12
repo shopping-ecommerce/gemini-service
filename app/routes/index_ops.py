@@ -104,3 +104,270 @@ def rebuild_index():
     except Exception as e:
         logger.error("Rebuild index failed: %s", e)
         return jsonify({"error": str(e)}), 500
+
+
+@index_bp.route("/index-single-product", methods=["POST"])
+def index_single_product():
+    """
+    Index text embedding cho MỘT product cụ thể
+    
+    Request body:
+    {
+        "product_id": "67123abc...",
+        "force_reindex": false  // optional: xóa và tạo lại nếu đã tồn tại
+    }
+    """
+    try:
+        from flask import request
+        from bson import ObjectId
+        
+        data = request.get_json()
+        if not data or "product_id" not in data:
+            return jsonify({"error": "product_id is required"}), 400
+        
+        product_id = data["product_id"]
+        force_reindex = data.get("force_reindex", False)
+        
+        mongo = current_app.config["MONGODB_SERVICE"]
+        products_col = mongo.db["products"]
+        embeddings_col = mongo.db["product_embeddings"]
+        
+        # Validate product exists
+        try:
+            oid = ObjectId(product_id) if ObjectId.is_valid(product_id) else product_id
+        except Exception:
+            oid = product_id
+        
+        product = products_col.find_one({"_id": oid})
+        if not product:
+            return jsonify({"error": f"Product {product_id} not found"}), 404
+        
+        pid = str(product["_id"])
+        
+        # Kiểm tra đã tồn tại chưa
+        existing = embeddings_col.find_one({"product_id": pid})
+        if existing and not force_reindex:
+            return jsonify({
+                "success": True,
+                "product_id": pid,
+                "message": "Product already indexed (use force_reindex=true to recreate)"
+            }), 200
+        
+        # Chuẩn bị text
+        name = product.get("name", "")
+        desc = product.get("description", "")
+        text = f"{name}. {desc}"
+        
+        if len(text) > 4000:
+            text = text[:4000]
+        
+        if not text.strip():
+            return jsonify({
+                "success": False,
+                "product_id": pid,
+                "error": "Product has no text content to index"
+            }), 400
+        
+        # Tạo embedding
+        try:
+            emb = _vs().create_embedding(text, task_type="RETRIEVAL_DOCUMENT")
+        except Exception as e:
+            logger.error(f"Failed to create embedding for product {pid}: {e}")
+            return jsonify({"error": f"Failed to create embedding: {str(e)}"}), 500
+        
+        if not emb:
+            return jsonify({"error": "Failed to create embedding"}), 500
+        
+        # Upsert vào MongoDB
+        now = datetime.now()
+        doc = {
+            "product_id": pid,
+            "embedding": emb,
+            "text": text,
+            "created_at": now,
+            "updated_at": now,
+        }
+        
+        embeddings_col.replace_one(
+            {"product_id": pid},
+            doc,
+            upsert=True
+        )
+        
+        # Upsert vào Vertex AI
+        try:
+            _vs().upsert_vector(pid, emb)
+            logger.info(f"Indexed product {pid}")
+        except Exception as ve:
+            logger.error(f"Failed to upsert to Vertex VS: {ve}")
+            return jsonify({"error": f"Failed to upsert to Vertex: {str(ve)}"}), 500
+        
+        return jsonify({
+            "success": True,
+            "product_id": pid,
+            "message": "Successfully indexed product"
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Index single product failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@index_bp.route("/remove-single-product", methods=["POST"])
+def remove_single_product():
+    """
+    Xóa text embedding của MỘT product
+    
+    Request body:
+    {
+        "product_id": "67123abc..."
+    }
+    """
+    try:
+        from flask import request
+        
+        data = request.get_json()
+        if not data or "product_id" not in data:
+            return jsonify({"error": "product_id is required"}), 400
+        
+        product_id = data["product_id"]
+        
+        mongo = current_app.config["MONGODB_SERVICE"]
+        embeddings_col = mongo.db["product_embeddings"]
+        
+        # Kiểm tra tồn tại
+        existing = embeddings_col.find_one({"product_id": product_id})
+        if not existing:
+            return jsonify({
+                "success": True,
+                "product_id": product_id,
+                "message": "Embedding not found (already removed)"
+            }), 200
+        
+        # Xóa từ MongoDB
+        embeddings_col.delete_one({"product_id": product_id})
+        
+        # Xóa từ Vertex AI
+        try:
+            _vs().remove_vectors([product_id])
+            logger.info(f"Removed product vector {product_id}")
+        except Exception as ve:
+            logger.warning(f"Could not remove vector from Vertex: {ve}")
+        
+        return jsonify({
+            "success": True,
+            "product_id": product_id,
+            "message": "Successfully removed product embedding"
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Remove single product failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@index_bp.route("/upsert-single-product", methods=["POST"])
+def upsert_single_product():
+    """
+    Thêm hoặc cập nhật text embedding cho MỘT product
+    (Alias của index-single-product với force_reindex=True)
+    
+    Request body:
+    {
+        "product_id": "67123abc..."
+    }
+    """
+    try:
+        from flask import request
+        
+        data = request.get_json()
+        if not data or "product_id" not in data:
+            return jsonify({"error": "product_id is required"}), 400
+        
+        # Force reindex
+        data["force_reindex"] = True
+        
+        # Reuse index_single_product logic
+        from bson import ObjectId
+        
+        product_id = data["product_id"]
+        
+        mongo = current_app.config["MONGODB_SERVICE"]
+        products_col = mongo.db["products"]
+        embeddings_col = mongo.db["product_embeddings"]
+        
+        # Validate product exists
+        try:
+            oid = ObjectId(product_id) if ObjectId.is_valid(product_id) else product_id
+        except Exception:
+            oid = product_id
+        
+        product = products_col.find_one({"_id": oid})
+        if not product:
+            return jsonify({"error": f"Product {product_id} not found"}), 404
+        
+        pid = str(product["_id"])
+        
+        # Chuẩn bị text
+        name = product.get("name", "")
+        desc = product.get("description", "")
+        text = f"{name}. {desc}"
+        
+        if len(text) > 4000:
+            text = text[:4000]
+        
+        if not text.strip():
+            return jsonify({
+                "success": False,
+                "product_id": pid,
+                "error": "Product has no text content to index"
+            }), 400
+        
+        # Tạo embedding
+        try:
+            emb = _vs().create_embedding(text, task_type="RETRIEVAL_DOCUMENT")
+        except Exception as e:
+            logger.error(f"Failed to create embedding for product {pid}: {e}")
+            return jsonify({"error": f"Failed to create embedding: {str(e)}"}), 500
+        
+        if not emb:
+            return jsonify({"error": "Failed to create embedding"}), 500
+        
+        # Upsert vào MongoDB
+        now = datetime.now()
+        doc = {
+            "product_id": pid,
+            "embedding": emb,
+            "text": text,
+            "updated_at": now,
+        }
+        
+        # Nếu đã tồn tại, giữ nguyên created_at
+        existing = embeddings_col.find_one({"product_id": pid})
+        if existing:
+            doc["created_at"] = existing.get("created_at", now)
+        else:
+            doc["created_at"] = now
+        
+        embeddings_col.replace_one(
+            {"product_id": pid},
+            doc,
+            upsert=True
+        )
+        
+        # Upsert vào Vertex AI
+        try:
+            _vs().upsert_vector(pid, emb)
+            logger.info(f"Upserted product {pid}")
+        except Exception as ve:
+            logger.error(f"Failed to upsert to Vertex VS: {ve}")
+            return jsonify({"error": f"Failed to upsert to Vertex: {str(ve)}"}), 500
+        
+        return jsonify({
+            "success": True,
+            "product_id": pid,
+            "message": "Successfully upserted product embedding"
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Upsert single product failed: {e}")
+        return jsonify({"error": str(e)}), 500

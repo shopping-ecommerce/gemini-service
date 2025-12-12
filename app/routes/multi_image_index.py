@@ -204,6 +204,441 @@ def rebuild_image_index_multi():
         return jsonify({"error": str(e)}), 500
 
 
+@multi_image_index_bp.route("/index-single-product-images", methods=["POST"])
+def index_single_product_images():
+    """
+    Index tất cả hình ảnh của MỘT product cụ thể
+    
+    Request body:
+    {
+        "product_id": "67123abc...",
+        "force_reindex": false  // optional: xóa và tạo lại nếu đã tồn tại
+    }
+    """
+    try:
+        from flask import request
+        from bson import ObjectId
+        
+        data = request.get_json()
+        if not data or "product_id" not in data:
+            return jsonify({"error": "product_id is required"}), 400
+        
+        product_id = data["product_id"]
+        force_reindex = data.get("force_reindex", False)
+        
+        mongo = current_app.config["MONGODB_SERVICE"]
+        products_col = mongo.db["products"]
+        image_embeddings_col = mongo.db["product_image_embeddings"]
+        
+        # Validate product exists
+        try:
+            oid = ObjectId(product_id) if ObjectId.is_valid(product_id) else product_id
+        except Exception:
+            oid = product_id
+        
+        product = products_col.find_one({"_id": oid})
+        if not product:
+            return jsonify({"error": f"Product {product_id} not found"}), 404
+        
+        pid = str(product["_id"])
+        images = product.get("images", [])
+        
+        if not images:
+            return jsonify({
+                "success": True,
+                "product_id": pid,
+                "indexed_count": 0,
+                "message": "Product has no images"
+            }), 200
+        
+        # Nếu force_reindex, xóa embeddings cũ của product này
+        if force_reindex:
+            old_datapoints = [
+                doc.get("datapoint_id") 
+                for doc in image_embeddings_col.find({"product_id": pid}, {"datapoint_id": 1})
+            ]
+            old_datapoints = [did for did in old_datapoints if did]
+            
+            if old_datapoints:
+                image_embeddings_col.delete_many({"product_id": pid})
+                try:
+                    _vs().remove_image_vectors(old_datapoints)
+                    logger.info(f"Removed {len(old_datapoints)} old image vectors for product {pid}")
+                except Exception as ve:
+                    logger.warning(f"Could not remove old image vectors: {ve}")
+        
+        # Chuẩn bị danh sách ảnh cần embed
+        to_embed = []
+        for img in images:
+            if isinstance(img, dict):
+                url = img.get("url")
+                position = img.get("position", 999)
+            elif isinstance(img, str):
+                url = img
+                position = 999
+            else:
+                continue
+            
+            if not url or not isinstance(url, str):
+                continue
+            
+            if not url.startswith(('http://', 'https://')):
+                continue
+            
+            datapoint_id = f"{pid}_{position}"
+            
+            # Skip nếu đã tồn tại (khi không force_reindex)
+            if not force_reindex:
+                existing = image_embeddings_col.find_one({"datapoint_id": datapoint_id})
+                if existing:
+                    logger.info(f"Skipping existing datapoint {datapoint_id}")
+                    continue
+            
+            to_embed.append({
+                "datapoint_id": datapoint_id,
+                "product_id": pid,
+                "image_url": url,
+                "position": position,
+                "product_name": product.get("name", "")
+            })
+        
+        if not to_embed:
+            return jsonify({
+                "success": True,
+                "product_id": pid,
+                "indexed_count": 0,
+                "message": "No new images to index"
+            }), 200
+        
+        # Rate limiting settings
+        REQUESTS_PER_MINUTE = 8
+        SECONDS_PER_REQUEST = 60.0 / REQUESTS_PER_MINUTE
+        
+        indexed_count = 0
+        failed_count = 0
+        
+        for item in to_embed:
+            datapoint_id = item["datapoint_id"]
+            img_url = item["image_url"]
+            
+            try:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+                response = requests.get(img_url, timeout=15, headers=headers)
+                
+                if response.status_code != 200:
+                    logger.warning(f"Failed to download {datapoint_id}: HTTP {response.status_code}")
+                    failed_count += 1
+                    continue
+                
+                image_bytes = response.content
+                
+                if len(image_bytes) > 10 * 1024 * 1024:
+                    logger.warning(f"Image too large {datapoint_id}: {len(image_bytes)} bytes")
+                    failed_count += 1
+                    continue
+                
+                # Tạo embedding
+                emb = _vs().create_image_embedding_from_bytes(image_bytes)
+                
+                if emb:
+                    now = datetime.now()
+                    doc = {
+                        "datapoint_id": datapoint_id,
+                        "product_id": item["product_id"],
+                        "embedding": emb,
+                        "image_url": img_url,
+                        "position": item["position"],
+                        "product_name": item["product_name"],
+                        "created_at": now,
+                    }
+                    
+                    image_embeddings_col.insert_one(doc)
+                    _vs().upsert_image_vector(datapoint_id, emb)
+                    
+                    indexed_count += 1
+                    logger.info(f"Indexed {datapoint_id} for product {pid}")
+                else:
+                    failed_count += 1
+                
+                # Delay để tuân thủ rate limit
+                time.sleep(SECONDS_PER_REQUEST)
+                
+            except Exception as e:
+                logger.warning(f"Failed to embed {datapoint_id}: {e}")
+                failed_count += 1
+                continue
+        
+        return jsonify({
+            "success": True,
+            "product_id": pid,
+            "indexed_count": indexed_count,
+            "failed_count": failed_count,
+            "message": f"Indexed {indexed_count} images for product {pid}"
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Index single product images failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@multi_image_index_bp.route("/remove-product-images", methods=["POST"])
+def remove_product_images():
+    """
+    Xóa tất cả image embeddings của MỘT product
+    
+    Request body:
+    {
+        "product_id": "67123abc..."
+    }
+    """
+    try:
+        from flask import request
+        
+        data = request.get_json()
+        if not data or "product_id" not in data:
+            return jsonify({"error": "product_id is required"}), 400
+        
+        product_id = data["product_id"]
+        
+        mongo = current_app.config["MONGODB_SERVICE"]
+        image_embeddings_col = mongo.db["product_image_embeddings"]
+        
+        # Lấy danh sách datapoint_ids cần xóa
+        datapoints = [
+            doc.get("datapoint_id") 
+            for doc in image_embeddings_col.find({"product_id": product_id}, {"datapoint_id": 1})
+        ]
+        datapoints = [did for did in datapoints if did]
+        
+        if not datapoints:
+            return jsonify({
+                "success": True,
+                "product_id": product_id,
+                "removed_count": 0,
+                "message": "No embeddings found for this product"
+            }), 200
+        
+        # Xóa từ MongoDB
+        result = image_embeddings_col.delete_many({"product_id": product_id})
+        
+        # Xóa từ Vertex AI
+        try:
+            _vs().remove_image_vectors(datapoints)
+            logger.info(f"Removed {len(datapoints)} image vectors for product {product_id}")
+        except Exception as ve:
+            logger.warning(f"Could not remove vectors from Vertex: {ve}")
+        
+        return jsonify({
+            "success": True,
+            "product_id": product_id,
+            "removed_count": result.deleted_count,
+            "message": f"Removed {result.deleted_count} image embeddings"
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Remove product images failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@multi_image_index_bp.route("/upsert-single-image", methods=["POST"])
+def upsert_single_image():
+    """
+    Thêm hoặc cập nhật embedding cho MỘT ảnh cụ thể
+    
+    Request body (multipart/form-data hoặc JSON):
+    - product_id: ID của product
+    - position: Vị trí của ảnh (số nguyên)
+    - image_url: URL của ảnh (nếu dùng JSON)
+    - image: File ảnh (nếu dùng multipart)
+    """
+    try:
+        from flask import request
+        
+        content_type = request.content_type or ""
+        is_multipart = "multipart/form-data" in content_type
+        
+        product_id = None
+        position = None
+        image_url = None
+        image_bytes = None
+        
+        if is_multipart:
+            product_id = request.form.get("product_id")
+            try:
+                position = int(request.form.get("position", 0))
+            except Exception:
+                position = 0
+            
+            if "image" in request.files:
+                file = request.files["image"]
+                if file.filename != "":
+                    image_bytes = file.read()
+        else:
+            data = request.get_json()
+            if not data:
+                return jsonify({"error": "No data provided"}), 400
+            
+            product_id = data.get("product_id")
+            try:
+                position = int(data.get("position", 0))
+            except Exception:
+                position = 0
+            image_url = data.get("image_url")
+        
+        if not product_id:
+            return jsonify({"error": "product_id is required"}), 400
+        
+        if not image_url and not image_bytes:
+            return jsonify({"error": "Either image_url or image file is required"}), 400
+        
+        datapoint_id = f"{product_id}_{position}"
+        
+        mongo = current_app.config["MONGODB_SERVICE"]
+        products_col = mongo.db["products"]
+        image_embeddings_col = mongo.db["product_image_embeddings"]
+        
+        # Validate product exists
+        from bson import ObjectId
+        try:
+            oid = ObjectId(product_id) if ObjectId.is_valid(product_id) else product_id
+        except Exception:
+            oid = product_id
+        
+        product = products_col.find_one({"_id": oid}, {"name": 1})
+        if not product:
+            return jsonify({"error": f"Product {product_id} not found"}), 404
+        
+        product_name = product.get("name", "")
+        
+        # Download image nếu cần
+        if image_url and not image_bytes:
+            try:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+                response = requests.get(image_url, timeout=15, headers=headers)
+                
+                if response.status_code != 200:
+                    return jsonify({"error": f"Failed to download image: HTTP {response.status_code}"}), 400
+                
+                image_bytes = response.content
+                
+            except Exception as e:
+                return jsonify({"error": f"Failed to download image: {str(e)}"}), 400
+        
+        if len(image_bytes) > 10 * 1024 * 1024:
+            return jsonify({"error": "Image too large (max 10MB)"}), 400
+        
+        # Tạo embedding
+        emb = _vs().create_image_embedding_from_bytes(image_bytes)
+        
+        if not emb:
+            return jsonify({"error": "Failed to create image embedding"}), 500
+        
+        # Upsert vào MongoDB
+        now = datetime.now()
+        doc = {
+            "datapoint_id": datapoint_id,
+            "product_id": product_id,
+            "embedding": emb,
+            "image_url": image_url or f"uploaded_{datapoint_id}",
+            "position": position,
+            "product_name": product_name,
+            "created_at": now,
+            "updated_at": now,
+        }
+        
+        image_embeddings_col.replace_one(
+            {"datapoint_id": datapoint_id},
+            doc,
+            upsert=True
+        )
+        
+        # Upsert vào Vertex AI
+        _vs().upsert_image_vector(datapoint_id, emb)
+        
+        logger.info(f"Upserted image embedding {datapoint_id} for product {product_id}")
+        
+        return jsonify({
+            "success": True,
+            "datapoint_id": datapoint_id,
+            "product_id": product_id,
+            "position": position,
+            "message": f"Successfully upserted image embedding"
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Upsert single image failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@multi_image_index_bp.route("/remove-single-image", methods=["POST"])
+def remove_single_image():
+    """
+    Xóa embedding của MỘT ảnh cụ thể
+    
+    Request body:
+    {
+        "product_id": "67123abc...",
+        "position": 0
+    }
+    hoặc
+    {
+        "datapoint_id": "67123abc..._0"
+    }
+    """
+    try:
+        from flask import request
+        
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        datapoint_id = data.get("datapoint_id")
+        
+        if not datapoint_id:
+            product_id = data.get("product_id")
+            position = data.get("position")
+            
+            if not product_id or position is None:
+                return jsonify({"error": "Either datapoint_id or (product_id + position) is required"}), 400
+            
+            datapoint_id = f"{product_id}_{position}"
+        
+        mongo = current_app.config["MONGODB_SERVICE"]
+        image_embeddings_col = mongo.db["product_image_embeddings"]
+        
+        # Kiểm tra tồn tại
+        existing = image_embeddings_col.find_one({"datapoint_id": datapoint_id})
+        if not existing:
+            return jsonify({
+                "success": True,
+                "datapoint_id": datapoint_id,
+                "message": "Embedding not found (already removed)"
+            }), 200
+        
+        # Xóa từ MongoDB
+        image_embeddings_col.delete_one({"datapoint_id": datapoint_id})
+        
+        # Xóa từ Vertex AI
+        try:
+            _vs().remove_image_vectors([datapoint_id])
+            logger.info(f"Removed image vector {datapoint_id}")
+        except Exception as ve:
+            logger.warning(f"Could not remove vector from Vertex: {ve}")
+        
+        return jsonify({
+            "success": True,
+            "datapoint_id": datapoint_id,
+            "message": "Successfully removed image embedding"
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Remove single image failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @multi_image_index_bp.route("/search-by-image-multi", methods=["POST"])
 def search_by_image_multi():
     """
